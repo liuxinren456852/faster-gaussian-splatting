@@ -9,7 +9,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-namespace faster_gs::rasterization::kernels::inference {
+namespace faster_gs::rasterization::kernels::pruning_scores {
 
     __global__ void preprocess_cu(
         const float3* __restrict__ means,
@@ -346,19 +346,17 @@ namespace faster_gs::rasterization::kernels::inference {
         if (instance_idx == n_instances - 1) tile_instance_ranges[instance_tile_idx].y = n_instances;
     }
 
-    __global__ void __launch_bounds__(config::block_size_blend) blend_cu(
+    __global__ void __launch_bounds__(config::block_size_blend) compute_scores_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ instance_primitive_indices,
         const float2* __restrict__ primitive_mean2d,
         const float4* __restrict__ primitive_conic_opacity,
         const float3* __restrict__ primitive_color,
         const float3* __restrict__ bg_color,
-        float* __restrict__ image,
+        float* __restrict__ scores,
         const uint width,
         const uint height,
-        const uint grid_width,
-        const bool output_chw,
-        const bool clamp_output)
+        const uint grid_width)
     {
         auto block = cg::this_thread_block();
         const dim3 group_index = block.group_index();
@@ -368,6 +366,7 @@ namespace faster_gs::rasterization::kernels::inference {
         const bool inside = pixel_coords.x < width && pixel_coords.y < height;
         const float2 pixel = make_float2(__uint2float_rn(pixel_coords.x), __uint2float_rn(pixel_coords.y)) + 0.5f;
         // setup shared memory
+        __shared__ uint collected_primitive_idx[config::block_size_blend];
         __shared__ float2 collected_mean2d[config::block_size_blend];
         __shared__ float4 collected_conic_opacity[config::block_size_blend];
         __shared__ float3 collected_color[config::block_size_blend];
@@ -381,6 +380,7 @@ namespace faster_gs::rasterization::kernels::inference {
             if (__syncthreads_count(done) == config::block_size_blend) break;
             if (current_fetch_idx < tile_range.y) {
                 const uint primitive_idx = instance_primitive_indices[current_fetch_idx];
+                collected_primitive_idx[thread_rank] = primitive_idx;
                 collected_mean2d[thread_rank] = primitive_mean2d[primitive_idx];
                 collected_conic_opacity[thread_rank] = primitive_conic_opacity[primitive_idx];
                 collected_color[thread_rank] = primitive_color[primitive_idx];
@@ -412,27 +412,62 @@ namespace faster_gs::rasterization::kernels::inference {
                 }
             }
         }
-        if (inside) {
-            // apply background color
-            color_pixel += transmittance * bg_color[0];
-            // store results
-            const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
-            if (clamp_output) {
-                color_pixel.x = __saturatef(color_pixel.x);
-                color_pixel.y = __saturatef(color_pixel.y);
-                color_pixel.z = __saturatef(color_pixel.z);
+
+        // re-run blending to compute the partial derivatives required for the pruning scores
+        const float3 grad_color_pixel = make_float3(1.0f);
+        const float grad_alpha_common = transmittance * -dot(grad_color_pixel, bg_color[0]);
+        float3 color_pixel_after = color_pixel; // let's just rename this for readability
+        transmittance = 1.0f;
+        done = !inside;
+        // collaborative loading and processing
+        for (int n_points_remaining = tile_range.y - tile_range.x, current_fetch_idx = tile_range.x + thread_rank; n_points_remaining > 0; n_points_remaining -= config::block_size_blend, current_fetch_idx += config::block_size_blend) {
+            if (__syncthreads_count(done) == config::block_size_blend) break;
+            if (current_fetch_idx < tile_range.y) {
+                const uint primitive_idx = instance_primitive_indices[current_fetch_idx];
+                collected_primitive_idx[thread_rank] = primitive_idx;
+                collected_mean2d[thread_rank] = primitive_mean2d[primitive_idx];
+                collected_conic_opacity[thread_rank] = primitive_conic_opacity[primitive_idx];
+                collected_color[thread_rank] = primitive_color[primitive_idx];
             }
-            if (output_chw) {
-                const uint n_pixels = width * height;
-                image[pixel_idx] = color_pixel.x;
-                image[n_pixels + pixel_idx] = color_pixel.y;
-                image[2 * n_pixels + pixel_idx] = color_pixel.z;
-            }
-            else {
-                const uint base_idx = 3 * pixel_idx;
-                image[base_idx] = color_pixel.x;
-                image[base_idx + 1] = color_pixel.y;
-                image[base_idx + 2] = color_pixel.z;
+            block.sync();
+            const int current_batch_size = min(config::block_size_blend, n_points_remaining);
+            for (int j = 0; !done && j < current_batch_size; ++j) {
+                // evaluate current Gaussian at pixel
+                const float4 conic_opacity = collected_conic_opacity[j];
+                const float3 conic = make_float3(conic_opacity);
+                const float opacity = conic_opacity.w;
+                const float2 delta = collected_mean2d[j] - pixel;
+                const float exponent = -0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) - conic.y * delta.x * delta.y;
+                const float gaussian = expf(fminf(exponent, 0.0f));
+                if (!config::original_opacity_interpretation && gaussian < config::min_alpha_threshold) continue;
+                const float alpha = opacity * gaussian;
+                if (config::original_opacity_interpretation && alpha < config::min_alpha_threshold) continue;
+
+                // update residual color
+                const float3 color = collected_color[j];
+                color_pixel_after -= transmittance * alpha * color;
+
+                // alpha gradient
+                const float one_minus_alpha = 1.0f - alpha;
+                const float one_minus_alpha_rcp = 1.0f / fmaxf(one_minus_alpha, config::one_minus_alpha_eps);
+                const float dL_dalpha_from_color = dot(transmittance * color - color_pixel_after * one_minus_alpha_rcp, grad_color_pixel);
+                const float dL_dalpha_from_alpha = grad_alpha_common * one_minus_alpha_rcp;
+                const float dL_dalpha = dL_dalpha_from_color + dL_dalpha_from_alpha;
+
+                // pruning score
+                const float dL_dgaussian = opacity * dL_dalpha;
+                const float pruning_score = dL_dgaussian * dL_dgaussian;
+                const uint primitive_idx = collected_primitive_idx[j];
+                atomicAdd(&scores[primitive_idx], pruning_score);
+
+                // update transmittance
+                transmittance *= one_minus_alpha;
+
+                // early stopping
+                if (transmittance < config::transmittance_threshold) {
+                    done = true;
+                    continue;
+                }
             }
         }
     }

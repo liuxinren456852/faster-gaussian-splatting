@@ -6,7 +6,7 @@
 
 namespace faster_gs::rasterization {
 
-    void inference(
+    void pruning_scores(
         std::function<char* (size_t)> resize_primitive_buffers,
         std::function<char* (size_t)> resize_tile_buffers,
         std::function<char* (size_t)> resize_instance_buffers,
@@ -19,7 +19,7 @@ namespace faster_gs::rasterization {
         const float4* w2c,
         const float3* cam_position,
         const float3* bg_color,
-        float* image,
+        float* scores,
         const int n_primitives,
         const int active_sh_bases,
         const int total_sh_bases,
@@ -31,26 +31,22 @@ namespace faster_gs::rasterization {
         const float center_y,
         const float near_plane,
         const float far_plane,
-        const bool proper_antialiasing,
-        const bool to_chw,
-        const bool clamp_output);
+        const bool proper_antialiasing);
 
     template <typename KeyT>
-    void rasterize(
+    void compute_scores(
         std::function<char* (size_t)>& resize_instance_buffers,
         PrimitiveBuffers& primitive_buffers,
         TileBuffers& tile_buffers,
         const dim3& grid,
         const dim3& block,
         const float3* bg_color,
-        float* image,
+        float* scores,
         const cudaStream_t memset_stream,
         const int n_visible_primitives,
         const int n_instances,
         const int end_bit,
         const int width,
-        const int height,
-        const bool to_chw,
-        const bool clamp_output);
+        const int height);
 
 }

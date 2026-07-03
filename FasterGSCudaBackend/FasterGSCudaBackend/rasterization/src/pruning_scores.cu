@@ -1,5 +1,5 @@
-#include "inference.h"
-#include "kernels_inference.cuh"
+#include "pruning_scores.h"
+#include "kernels_pruning_scores.cuh"
 #include "buffer_utils.h"
 #include "rasterization_config.h"
 #include "utils.h"
@@ -8,7 +8,7 @@
 #include <functional>
 
 // sorting is done separately for depth and tile as proposed in https://github.com/m-schuetz/Splatshop
-void faster_gs::rasterization::inference(
+void faster_gs::rasterization::pruning_scores(
     std::function<char* (size_t)> resize_primitive_buffers,
     std::function<char* (size_t)> resize_tile_buffers,
     std::function<char* (size_t)> resize_instance_buffers,
@@ -21,7 +21,7 @@ void faster_gs::rasterization::inference(
     const float4* w2c,
     const float3* cam_position,
     const float3* bg_color,
-    float* image,
+    float* scores,
     const int n_primitives,
     const int active_sh_bases,
     const int total_sh_bases,
@@ -33,9 +33,7 @@ void faster_gs::rasterization::inference(
     const float center_y,
     const float near_plane,
     const float far_plane,
-    const bool proper_antialiasing,
-    const bool to_chw,
-    const bool clamp_output)
+    const bool proper_antialiasing)
 {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const dim3 block(config::tile_width, config::tile_height, 1);
@@ -62,7 +60,7 @@ void faster_gs::rasterization::inference(
     cudaMemset(primitive_buffers.n_visible_primitives, 0, sizeof(uint));
     cudaMemset(primitive_buffers.n_instances, 0, sizeof(uint));
 
-    kernels::inference::preprocess_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess>>>(
+    kernels::pruning_scores::preprocess_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess>>>(
         means,
         scales,
         rotations,
@@ -111,7 +109,7 @@ void faster_gs::rasterization::inference(
     );
     CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (depth)")
 
-    kernels::inference::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering>>>(
+    kernels::pruning_scores::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering>>>(
         primitive_buffers.primitive_indices.Current(),
         primitive_buffers.n_touched_tiles,
         primitive_buffers.offset,
@@ -131,49 +129,45 @@ void faster_gs::rasterization::inference(
     // with 16x16 tiles, 16 bit keys are sufficient for up to 16M pixels, i.e., 4Kx4K images
     // beyond that, 32 bit keys are needed and for best performance, we template the remaining rasterization steps
     // note that with c++20 one could use a templated lambda to improve readability here
-    #define RASTERIZE_ARGS \
+    #define COMPUTE_SCORES_ARGS \
         resize_instance_buffers, \
         primitive_buffers, \
         tile_buffers, \
         grid, \
         block, \
         bg_color, \
-        image, \
+        scores, \
         memset_stream, \
         n_visible_primitives, \
         n_instances, \
         end_bit, \
         width, \
-        height, \
-        to_chw, \
-        clamp_output
-    if (end_bit <= 16) rasterize<ushort>(RASTERIZE_ARGS);
-    else rasterize<uint>(RASTERIZE_ARGS);
-    #undef RASTERIZE_ARGS
+        height
+    if (end_bit <= 16) compute_scores<ushort>(COMPUTE_SCORES_ARGS);
+    else compute_scores<uint>(COMPUTE_SCORES_ARGS);
+    #undef COMPUTE_SCORES_ARGS
 }
 
 template <typename KeyT>
-void faster_gs::rasterization::rasterize(
+void faster_gs::rasterization::compute_scores(
     std::function<char* (size_t)>& resize_instance_buffers,
     PrimitiveBuffers& primitive_buffers,
     TileBuffers& tile_buffers,
     const dim3& grid,
     const dim3& block,
     const float3* bg_color,
-    float* image,
+    float* scores,
     const cudaStream_t memset_stream,
     const int n_visible_primitives,
     const int n_instances,
     const int end_bit,
     const int width,
-    const int height,
-    const bool to_chw,
-    const bool clamp_output)
+    const int height)
 {
     char* instance_buffers_blob = resize_instance_buffers(required<InstanceBuffers<KeyT>>(n_instances, end_bit));
     InstanceBuffers<KeyT> instance_buffers = InstanceBuffers<KeyT>::from_blob(instance_buffers_blob, n_instances, end_bit);
 
-    kernels::inference::create_instances_cu<KeyT><<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances>>>(
+    kernels::pruning_scores::create_instances_cu<KeyT><<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances>>>(
         primitive_buffers.primitive_indices.Current(),
         primitive_buffers.offset,
         primitive_buffers.screen_bounds,
@@ -199,7 +193,7 @@ void faster_gs::rasterization::rasterize(
     if constexpr (!config::debug) cudaStreamSynchronize(memset_stream);
 
     if (n_instances > 0) {
-        kernels::inference::extract_instance_ranges_cu<KeyT><<<div_round_up(n_instances, config::block_size_extract_instance_ranges), config::block_size_extract_instance_ranges>>>(
+        kernels::pruning_scores::extract_instance_ranges_cu<KeyT><<<div_round_up(n_instances, config::block_size_extract_instance_ranges), config::block_size_extract_instance_ranges>>>(
             instance_buffers.keys.Current(),
             tile_buffers.instance_ranges,
             n_instances
@@ -207,19 +201,17 @@ void faster_gs::rasterization::rasterize(
         CHECK_CUDA(config::debug, "extract_instance_ranges")
     }
 
-    kernels::inference::blend_cu<<<grid, block>>>(
+    kernels::pruning_scores::compute_scores_cu<<<grid, block>>>(
         tile_buffers.instance_ranges,
         instance_buffers.primitive_indices.Current(),
         primitive_buffers.mean2d,
         primitive_buffers.conic_opacity,
         primitive_buffers.color,
         bg_color,
-        image,
+        scores,
         width,
         height,
-        grid.x,
-        to_chw,
-        clamp_output
+        grid.x
     );
-    CHECK_CUDA(config::debug, "blend")
+    CHECK_CUDA(config::debug, "compute_scores")
 }
